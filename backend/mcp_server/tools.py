@@ -1,8 +1,9 @@
 """Voicebox MCP tool implementations.
 
-Thin wrappers over existing services/routes. Tools are registered with dotted
-names (``voicebox.speak`` etc.) so they look natural in agent logs —
-the Python function name stays snake_case.
+Thin wrappers over existing services/routes. Tools are registered with
+underscore-separated names (``voicebox_speak`` etc.): MCP clients such as
+Claude Desktop validate tool names against ``^[a-zA-Z0-9_-]{1,64}$`` and
+reject the whole tool list if any name contains a dot (#790).
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ def register_tools(mcp: FastMCP) -> None:
     """Attach all Voicebox tools to the given FastMCP instance."""
 
     @mcp.tool(
-        name="voicebox.speak",
+        name="voicebox_speak",
         description=(
             "Speak text in a Voicebox voice profile. Returns a generation id "
             "the caller can poll at /generate/{id}/status. Audio plays on the "
@@ -104,7 +105,7 @@ def register_tools(mcp: FastMCP) -> None:
                 profile_name=vp.name,
                 text=text,
                 engine=resolved_engine,
-                language=language,
+                language=language or vp.language,
                 personality=use_persona,
                 model_size=model_size,
                 db=db,
@@ -113,7 +114,7 @@ def register_tools(mcp: FastMCP) -> None:
             db.close()
 
     @mcp.tool(
-        name="voicebox.transcribe",
+        name="voicebox_transcribe",
         description=(
             "Transcribe an audio clip to text using Voicebox's local Whisper. "
             "Pass exactly one of `audio_base64` (bytes as base64) or "
@@ -171,7 +172,7 @@ def register_tools(mcp: FastMCP) -> None:
             tmp_path.unlink(missing_ok=True)
 
     @mcp.tool(
-        name="voicebox.list_captures",
+        name="voicebox_list_captures",
         description=(
             "List recent voice captures (dictations, recordings, uploads) "
             "with their transcripts. Most-recent first."
@@ -199,10 +200,10 @@ def register_tools(mcp: FastMCP) -> None:
             db.close()
 
     @mcp.tool(
-        name="voicebox.list_profiles",
+        name="voicebox_list_profiles",
         description=(
             "List available voice profiles (both cloned voices and presets). "
-            "Use the returned `name` with voicebox.speak(profile=...)."
+            "Use the returned `name` with voicebox_speak(profile=...)."
         ),
     )
     async def voicebox_list_profiles() -> dict[str, Any]:

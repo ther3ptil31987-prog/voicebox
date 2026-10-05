@@ -85,7 +85,7 @@ class GenerationRequest(BaseModel):
     seed: Optional[int] = Field(None, ge=0)
     model_size: Optional[str] = Field(default="1.7B", pattern="^(1\\.7B|0\\.6B|1B|3B)$")
     instruct: Optional[str] = Field(None, max_length=500)
-    engine: Optional[str] = Field(default="qwen", pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$")
+    engine: Optional[str] = Field(default=None, pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$")
     personality: bool = Field(
         default=False,
         description="When true and the profile has a personality prompt, the input text is rewritten in-character before TTS.",
@@ -309,7 +309,7 @@ class GenerationSettingsUpdate(BaseModel):
 
 class MCPClientBindingResponse(BaseModel):
     """Per-MCP-client voice binding — what voice / engine the server should
-    use when a given client_id calls voicebox.speak without args, plus an
+    use when a given client_id calls voicebox_speak without args, plus an
     opt-in personality-rewrite default."""
 
     client_id: str
@@ -346,7 +346,7 @@ class MCPClientBindingListResponse(BaseModel):
 
 
 class SpeakRequest(BaseModel):
-    """Body for POST /speak — non-MCP REST surface that mirrors voicebox.speak."""
+    """Body for POST /speak — non-MCP REST surface that mirrors voicebox_speak."""
 
     text: str = Field(..., min_length=1, max_length=10000)
     profile: Optional[str] = Field(
@@ -445,6 +445,7 @@ class HealthResponse(BaseModel):
     backend_variant: Optional[str] = None  # Binary variant (cpu, cuda, or rocm)
     supports_rocm: bool = False  # AMD GPU on Windows — the ROCm backend is applicable
     gpu_compatibility_warning: Optional[str] = None  # Warning if GPU arch unsupported
+    cloud_enabled: bool = False  # VOICEBOX_CLOUD_ENABLED — the app shows the Cloud section only when true
 
 
 class DirectoryCheck(BaseModel):
@@ -487,6 +488,19 @@ class ModelDownloadRequest(BaseModel):
     """Request model for triggering model download."""
 
     model_name: str
+
+
+class ModelLoadRequest(BaseModel):
+    """Request model for loading or unloading a model by name.
+
+    ``model_name`` is one of the ids returned by ``GET /models/status``
+    (e.g. ``"kokoro"``, ``"qwen-tts-0.6B"``, ``"whisper-turbo"``).
+    ``model_size`` is the legacy Qwen-only selector, kept so existing
+    ``POST /models/load?model_size=0.6B`` callers keep working.
+    """
+
+    model_name: Optional[str] = None
+    model_size: Optional[str] = None
 
 
 class ModelMigrateRequest(BaseModel):

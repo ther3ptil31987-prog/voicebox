@@ -44,8 +44,8 @@ class VoiceProfile(Base):
     design_prompt = Column(Text, nullable=True)      # text description — only for designed (reserved)
     default_engine = Column(String, nullable=True)   # auto-selected engine, locked for preset
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    updated_at = Column(DateTime, default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
 ```
 
 The `voice_type` column discriminates the three flavors:

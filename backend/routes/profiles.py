@@ -4,7 +4,7 @@ import io
 import json as _json
 import logging
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from .. import config, models
-from ..app import safe_content_disposition
+from ..utils.http import safe_content_disposition
 from ..database import VoiceProfile as DBVoiceProfile, get_db
 from ..services import channels, export_import, personality, profiles
 from ..services.profiles import _profile_to_response
@@ -356,7 +356,7 @@ async def update_profile_effects(
     else:
         profile.effects_chain = None
 
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = datetime.now(UTC)
     db.commit()
     db.refresh(profile)
 

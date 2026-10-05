@@ -410,7 +410,7 @@
     },
     "deleteDialog": {
       "title": "Elimina profilo",
-      "body": "Sei sicuro di voler eliminare \"{{name}}\"? Questa azione non può essere annullata.",
+      "body": "Sei sicuro di voler eliminare \"{{name}}\"? Verranno eliminate anche tutte le generazioni create con questa voce, inclusi i relativi file audio. Questa azione non può essere annullata.",
       "deleting": "Eliminazione in corso…"
     }
   },
@@ -1055,7 +1055,7 @@
       },
       "defaultVoice": {
         "title": "Voce predefinita",
-        "description": "Utilizzata quando un agente chiama voicebox.speak senza specificare un profilo e non ha un'associazione per singolo client.",
+        "description": "Utilizzata quando un agente chiama voicebox_speak senza specificare un profilo e non ha un'associazione per singolo client.",
         "label": "Voce di riproduzione predefinita",
         "labelHint": "Condivisa con il menu a discesa 'Riproduci come voce' della scheda Acquisizioni — una sola voce predefinita per la riproduzione passiva.",
         "none": "(nessuna)"

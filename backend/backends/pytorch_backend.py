@@ -10,6 +10,10 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+WHISPER_SAMPLE_RATE = 16000
+# Whisper encodes one 30s window per pass; longer audio needs sequential long-form decoding.
+WHISPER_WINDOW_SAMPLES = 30 * WHISPER_SAMPLE_RATE
+
 from . import TTSBackend, STTBackend, LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS
 from .base import (
     is_model_cached,
@@ -231,12 +235,13 @@ class PyTorchTTSBackend:
 
             # See _create_prompt_sync comment — inference runs with the
             # process's default HF_HUB_OFFLINE state (issue #462).
-            wavs, sample_rate = self.model.generate_voice_clone(
-                text=text,
-                voice_clone_prompt=voice_prompt,
-                language=LANGUAGE_CODE_TO_NAME.get(language, "auto"),
-                instruct=instruct,
-            )
+            with torch.inference_mode():
+                wavs, sample_rate = self.model.generate_voice_clone(
+                    text=text,
+                    voice_clone_prompt=voice_prompt,
+                    language=LANGUAGE_CODE_TO_NAME.get(language, "auto"),
+                    instruct=instruct,
+                )
             return wavs[0], sample_rate
 
         # Run blocking inference in thread pool to avoid blocking event loop
@@ -336,29 +341,52 @@ class PyTorchSTTBackend:
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
             # Load audio
-            audio, _sr = load_audio(audio_path, sample_rate=16000)
+            audio, _sr = load_audio(audio_path, sample_rate=WHISPER_SAMPLE_RATE)
 
             # Inference runs with the process's default HF_HUB_OFFLINE
             # state — forcing offline here (issue #462) broke online users
             # whose `get_decoder_prompt_ids` / tokenizer calls issue
             # legitimate metadata lookups.
-            # Process audio
+            # Process audio.
+            # truncation=False + padding="longest" + return_attention_mask=True
+            # are required for long-form transcription. Without them the
+            # feature extractor silently truncates to 30s (Whisper's native
+            # window) and audio past that point is dropped.
+            #
+            # Only use them for audio longer than one 30s window. For shorter
+            # clips the default pad-to-30s path is needed: with
+            # padding="longest" the encoder rejects the shorter mel input
+            # ("expects the mel input features to be of length 3000") when
+            # generate() runs language detection, i.e. whenever no language
+            # is forced.
+            is_long_form = len(audio) > WHISPER_WINDOW_SAMPLES
+            processor_kwargs = (
+                {"truncation": False, "padding": "longest", "return_attention_mask": True}
+                if is_long_form
+                else {}
+            )
             inputs = self.processor(
                 audio,
-                sampling_rate=16000,
+                sampling_rate=WHISPER_SAMPLE_RATE,
                 return_tensors="pt",
+                **processor_kwargs,
             )
             inputs = inputs.to(self.device)
 
-            # Generate transcription
-            # If language is provided, force it; otherwise let Whisper auto-detect
+            # Generate transcription.
+            # If language is provided, force it; otherwise let Whisper
+            # auto-detect. Pass language/task directly to generate() instead
+            # of building forced_decoder_ids — get_decoder_prompt_ids defaults
+            # to no_timestamps=True, which injects <|notimestamps|> and
+            # disables the timestamp tokens that return_timestamps=True (and
+            # therefore long-form decoding) depend on.
             generate_kwargs = {}
             if language:
-                forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-                    language=language,
-                    task="transcribe",
-                )
-                generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
+                generate_kwargs["language"] = language
+                generate_kwargs["task"] = "transcribe"
+            if is_long_form:
+                generate_kwargs["attention_mask"] = inputs["attention_mask"]
+                generate_kwargs["return_timestamps"] = True
 
             with torch.no_grad():
                 predicted_ids = self.model.generate(

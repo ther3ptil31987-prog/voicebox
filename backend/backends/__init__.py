@@ -45,6 +45,11 @@ WHISPER_HF_REPOS = {
 }
 
 
+# mlx-audio's Chatterbox loader fetches the S3 speech tokenizer from this
+# second repo; see chatterbox_mlx_backend.
+CHATTERBOX_MLX_S3_TOKENIZER_REPO = "mlx-community/S3TokenizerV2"
+
+
 @dataclass
 class ModelConfig:
     """Declarative config for a downloadable model variant."""
@@ -53,6 +58,9 @@ class ModelConfig:
     display_name: str  # e.g. "LuxTTS (Fast, CPU-friendly)"
     engine: str  # e.g. "luxtts", "chatterbox"
     hf_repo_id: str  # e.g. "YatharthS/LuxTTS"
+    # Extra HF repos the backend fetches at load time (e.g. a shared
+    # tokenizer); download status and delete must account for them too.
+    aux_hf_repo_ids: tuple[str, ...] = ()
     model_size: str = "default"
     size_mb: int = 0
     needs_trim: bool = False
@@ -290,10 +298,21 @@ def _get_qwen_custom_voice_configs() -> list[ModelConfig]:
 
 
 def _get_non_qwen_tts_configs() -> list[ModelConfig]:
-    """Return model configs for non-Qwen TTS engines.
+    """Return model configs for non-Qwen TTS engines."""
+    # Chatterbox multilingual follows the same backend-aware split as Qwen: the MLX
+    # backend loads pre-converted weights, so the download must match the backend that
+    # will consume it.
+    on_mlx = get_backend_type() == "mlx"
+    if on_mlx:
+        chatterbox_repo = "mlx-community/chatterbox-multilingual-v3"
+        # 2.5 GB of weights plus the separately fetched S3TokenizerV2 (~470 MB)
+        chatterbox_size_mb = 3000
+        chatterbox_aux_repos = (CHATTERBOX_MLX_S3_TOKENIZER_REPO,)
+    else:
+        chatterbox_repo = "ResembleAI/chatterbox"
+        chatterbox_size_mb = 3200
+        chatterbox_aux_repos = ()
 
-    These are static — no backend-type branching needed.
-    """
     return [
         ModelConfig(
             model_name="luxtts",
@@ -307,9 +326,15 @@ def _get_non_qwen_tts_configs() -> list[ModelConfig]:
             model_name="chatterbox-tts",
             display_name="Chatterbox TTS (Multilingual)",
             engine="chatterbox",
-            hf_repo_id="ResembleAI/chatterbox",
-            size_mb=3200,
+            hf_repo_id=chatterbox_repo,
+            aux_hf_repo_ids=chatterbox_aux_repos,
+            size_mb=chatterbox_size_mb,
             needs_trim=True,
+            # Same EOS miss the qwen configs guard against: on mlx-audio the decoder can run past
+            # the end of the sentence and emit silence followed by codec noise, which reaches the
+            # listener as an endless hiss. Retrying the affected text as smaller chunks is the
+            # existing remedy; it just was not wired for this engine.
+            retries_runaway=on_mlx,
             languages=[
                 "zh",
                 "en",
@@ -566,6 +591,7 @@ def unload_model_by_config(config: ModelConfig) -> bool:
     """Unload a model given its config. Returns True if it was loaded, False otherwise."""
     from . import get_tts_backend_for_engine
     from ..services import tts, transcribe, llm as llm_service
+    from ..utils.cache import clear_voice_prompt_memory_cache
 
     if config.engine == "whisper":
         whisper_model = transcribe.get_whisper_model()
@@ -594,6 +620,7 @@ def unload_model_by_config(config: ModelConfig) -> bool:
         backend = get_tts_backend_for_engine(config.engine)
         loaded_size = getattr(backend, "_current_model_size", None) or getattr(backend, "model_size", None)
         if backend.is_loaded() and loaded_size == config.model_size:
+            clear_voice_prompt_memory_cache()
             backend.unload_model()
             return True
         return False
@@ -601,6 +628,7 @@ def unload_model_by_config(config: ModelConfig) -> bool:
     # All other TTS engines
     backend = get_tts_backend_for_engine(config.engine)
     if backend.is_loaded():
+        clear_voice_prompt_memory_cache()
         backend.unload_model()
         return True
     return False
@@ -704,9 +732,16 @@ def get_tts_backend_for_engine(engine: str) -> TTSBackend:
 
             backend = LuxTTSBackend()
         elif engine == "chatterbox":
-            from .chatterbox_backend import ChatterboxTTSBackend
+            # Same split the qwen engine already makes: on Apple Silicon the MLX/Metal
+            # port renders 7-9x faster than the CPU-pinned PyTorch path.
+            if get_backend_type() == "mlx":
+                from .chatterbox_mlx_backend import ChatterboxMLXTTSBackend
 
-            backend = ChatterboxTTSBackend()
+                backend = ChatterboxMLXTTSBackend()
+            else:
+                from .chatterbox_backend import ChatterboxTTSBackend
+
+                backend = ChatterboxTTSBackend()
         elif engine == "chatterbox_turbo":
             from .chatterbox_turbo_backend import ChatterboxTurboTTSBackend
 

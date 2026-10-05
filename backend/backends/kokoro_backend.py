@@ -276,18 +276,27 @@ class KokoroTTSBackend:
 
             # Generate all chunks and concatenate
             audio_chunks = []
-            for result in pipeline(text, voice=voice_name, speed=1.0):
-                if result.audio is not None:
-                    chunk = result.audio
-                    if isinstance(chunk, torch.Tensor):
-                        chunk = chunk.detach().cpu().numpy()
-                    audio_chunks.append(chunk.squeeze())
+            with torch.inference_mode():
+                for result in pipeline(text, voice=voice_name, speed=1.0):
+                    if result.audio is not None:
+                        chunk = result.audio
+                        if isinstance(chunk, torch.Tensor):
+                            chunk = chunk.detach().cpu().numpy()
+                        audio_chunks.append(chunk.squeeze())
 
             if not audio_chunks:
                 # Return 1 second of silence as fallback
                 return np.zeros(KOKORO_SAMPLE_RATE, dtype=np.float32), KOKORO_SAMPLE_RATE
 
-            audio = np.concatenate(audio_chunks)
-            return audio.astype(np.float32), KOKORO_SAMPLE_RATE
+            audio = np.concatenate(audio_chunks).astype(np.float32)
+            from ..utils.audio import trim_tts_output
+
+            # Edge-only trim: Kokoro pads ~0.3s before and ~0.7s after speech.
+            # The internal-gap cut is disabled because KPipeline synthesizes
+            # newline/token-limit segments independently and the pads at each
+            # segment boundary add up to >1s of silence; with the default cut
+            # everything after the first segment would be dropped.
+            audio = trim_tts_output(audio, sample_rate=KOKORO_SAMPLE_RATE, max_internal_silence_ms=None)
+            return audio, KOKORO_SAMPLE_RATE
 
         return await asyncio.to_thread(_generate_sync)

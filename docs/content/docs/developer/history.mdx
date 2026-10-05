@@ -28,7 +28,7 @@ class Generation(Base):
     status = Column(String, default="completed")  # pending | completed | failed
     error = Column(Text, nullable=True)
     is_favorited = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
 ```
 
 Each generation can also have multiple **generation versions** — processed variants with different effects chains applied. The original (`clean`) version plus any number of processed versions live in a separate `generation_versions` table. See [Effects Pipeline](/developer/effects-pipeline).
@@ -71,7 +71,7 @@ async def create_generation(
         duration=duration,
         seed=seed,
         instruct=instruct,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(UTC),
     )
     
     db.add(db_generation)

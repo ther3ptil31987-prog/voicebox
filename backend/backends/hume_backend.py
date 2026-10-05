@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 # HuggingFace repos
 TADA_CODEC_REPO = "HumeAI/tada-codec"
+# TADA hardcodes the gated meta-llama/Llama-3.2-1B tokenizer; we load it from
+# this ungated mirror instead (see load_model).
+TADA_TOKENIZER_REPO = "unsloth/Llama-3.2-1B"
 TADA_1B_REPO = "HumeAI/tada-1b"
 TADA_3B_ML_REPO = "HumeAI/tada-3b-ml"
 
@@ -50,6 +53,12 @@ _TADA_MODEL_WEIGHT_FILES = [
 
 _TADA_CODEC_WEIGHT_FILES = [
     "encoder/model.safetensors",
+]
+
+_TADA_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
 ]
 
 
@@ -80,7 +89,8 @@ class HumeTadaBackend:
         repo = TADA_MODEL_REPOS.get(model_size, TADA_1B_REPO)
         model_cached = is_model_cached(repo, required_files=_TADA_MODEL_WEIGHT_FILES)
         codec_cached = is_model_cached(TADA_CODEC_REPO, required_files=_TADA_CODEC_WEIGHT_FILES)
-        return model_cached and codec_cached
+        tokenizer_cached = is_model_cached(TADA_TOKENIZER_REPO, required_files=_TADA_TOKENIZER_FILES)
+        return model_cached and codec_cached and tokenizer_cached
 
     async def load_model(self, model_size: str = "1B") -> None:
         """Load the TADA model and encoder."""
@@ -140,7 +150,7 @@ class HumeTadaBackend:
             # local cache path so we can point TADA at it directly.
             logger.info("Downloading Llama tokenizer (ungated mirror)...")
             tokenizer_path = snapshot_download(
-                repo_id="unsloth/Llama-3.2-1B",
+                repo_id=TADA_TOKENIZER_REPO,
                 token=None,
                 allow_patterns=["tokenizer*", "special_tokens*"],
             )

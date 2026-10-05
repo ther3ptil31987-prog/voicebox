@@ -4,14 +4,21 @@ import json as _json
 import logging
 import shutil
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import config
-from ..database import Generation as DBGeneration, ProfileSample as DBProfileSample, VoiceProfile as DBVoiceProfile
+from ..database import (
+    CaptureSettings as DBCaptureSettings,
+    Generation as DBGeneration,
+    MCPClientBinding as DBMCPClientBinding,
+    ProfileChannelMapping as DBProfileChannelMapping,
+    ProfileSample as DBProfileSample,
+    VoiceProfile as DBVoiceProfile,
+)
 from ..models import (
     EffectConfig,
     ProfileSampleResponse,
@@ -21,6 +28,7 @@ from ..models import (
 from ..utils.audio import save_audio, validate_and_load_reference_audio
 from ..utils.cache import _get_cache_dir, clear_profile_cache
 from ..utils.images import process_avatar, validate_image
+from . import history
 
 logger = logging.getLogger(__name__)
 
@@ -183,8 +191,8 @@ async def create_profile(
         design_prompt=data.design_prompt,
         default_engine=default_engine,
         personality=data.personality,
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
     )
 
     db.add(db_profile)
@@ -244,7 +252,7 @@ async def add_profile_sample(
 
     db.add(db_sample)
 
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = datetime.now(UTC)
 
     db.commit()
     db.refresh(db_sample)
@@ -403,7 +411,7 @@ async def update_profile(
     profile.personality = data.personality
     if data.default_engine is not None:
         profile.default_engine = data.default_engine or None  # empty string → NULL
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = datetime.now(UTC)
 
     db.commit()
     db.refresh(profile)
@@ -429,7 +437,23 @@ async def delete_profile(
     if not profile:
         return False
 
+    # Generations carry a non-null FK to the profile and the history query
+    # inner-joins profiles, so anything left behind here becomes a row the UI
+    # can never show and a .wav in data/generations the user can never reclaim.
+    deleted_generations = await history.delete_generations_by_profile(profile_id, db, commit=False)
+    if deleted_generations:
+        logger.info("Deleted %d generations belonging to profile %s", deleted_generations, profile_id)
+
     db.query(DBProfileSample).filter_by(profile_id=profile_id).delete()
+    db.query(DBProfileChannelMapping).filter_by(profile_id=profile_id).delete()
+
+    # Nullable pointers at the profile — resolve_profile() already tolerates a
+    # dangling id, but leaving one behind makes the UI show an empty selection
+    # that the user can't clear.
+    db.query(DBMCPClientBinding).filter_by(profile_id=profile_id).update({"profile_id": None})
+    db.query(DBCaptureSettings).filter_by(default_playback_voice_id=profile_id).update(
+        {"default_playback_voice_id": None}
+    )
 
     db.delete(profile)
     db.commit()
@@ -672,7 +696,7 @@ async def upload_avatar(
     process_avatar(image_path, str(output_path))
 
     profile.avatar_path = config.to_storage_path(output_path)
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = datetime.now(UTC)
 
     db.commit()
     db.refresh(profile)
@@ -703,7 +727,7 @@ async def delete_avatar(
         avatar_path.unlink()
 
     profile.avatar_path = None
-    profile.updated_at = datetime.utcnow()
+    profile.updated_at = datetime.now(UTC)
 
     db.commit()
 

@@ -7,19 +7,39 @@ import asyncio
 import logging
 import numpy as np
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# MLX's Metal backend keeps a per-thread stream registry. Loading a model on
+# one worker thread (via asyncio.to_thread, which round-robins across the
+# default executor's pool) and then generating on a different worker thread
+# raises "There is no Stream(gpu, N) in current thread." All MLX calls in
+# this module must therefore run on the SAME OS thread for the process
+# lifetime — route them through this single-worker executor instead of
+# asyncio.to_thread's shared multi-worker pool.
+_mlx_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-worker")
+
+
+def _run_on_mlx_thread(func, *args):
+    loop = asyncio.get_running_loop()
+    return loop.run_in_executor(_mlx_executor, func, *args)
+
 # PATCH: Import and apply offline patch BEFORE any huggingface_hub usage
 # This prevents mlx_audio from making network requests when models are cached
-from ..utils.hf_offline_patch import patch_huggingface_hub_offline, ensure_original_qwen_config_cached
+from ..utils.hf_offline_patch import patch_huggingface_hub_offline, ensure_original_qwen_config_cached  # noqa: E402
 
 patch_huggingface_hub_offline()
 ensure_original_qwen_config_cached()
 
-from . import TTSBackend, STTBackend, LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS
-from .base import is_model_cached, combine_voice_prompts as _combine_voice_prompts, model_load_progress
-from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt
+from . import TTSBackend, STTBackend, LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS  # noqa: E402
+from .base import (  # noqa: E402
+    is_model_cached,
+    combine_voice_prompts as _combine_voice_prompts,
+    model_load_progress,
+    empty_mlx_cache,
+)
+from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt  # noqa: E402
 
 
 class MLXTTSBackend:
@@ -29,6 +49,10 @@ class MLXTTSBackend:
         self.model = None
         self.model_size = model_size
         self._current_model_size = None
+        # Guards the whole load-then-use sequence in generate()/create_voice_prompt()
+        # so a concurrent request for a different model_size can't swap self.model
+        # out from under an in-flight request between its load and its inference.
+        self._op_lock = asyncio.Lock()
 
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
@@ -77,15 +101,22 @@ class MLXTTSBackend:
         if self.model is not None and self._current_model_size == model_size:
             return
 
-        # Unload existing model if different size requested
-        if self.model is not None and self._current_model_size != model_size:
-            self.unload_model()
-
-        # Run blocking load in thread pool
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        # Unload (if needed) and load as ONE callable on the MLX worker thread.
+        # Doing this as two separate _run_on_mlx_thread calls would run the
+        # unload on whichever thread issues the second call — usually still
+        # correct, but a caller-side await gap between them would let another
+        # coroutine slip a conflicting load in between. One callable removes
+        # the gap.
+        await _run_on_mlx_thread(self._reload_sync, model_size)
 
     # Alias for compatibility
     load_model = load_model_async
+
+    def _reload_sync(self, model_size: str):
+        """Unload a mismatched model and load the requested one, in one MLX-thread op."""
+        if self.model is not None and self._current_model_size != model_size:
+            self._unload_model_sync()
+        self._load_model_sync(model_size)
 
     def _load_model_sync(self, model_size: str):
         """Synchronous model loading."""
@@ -105,11 +136,25 @@ class MLXTTSBackend:
         logger.info("MLX TTS model %s loaded successfully", model_size)
 
     def unload_model(self):
-        """Unload the model to free memory."""
+        """Unload the model to free memory.
+
+        Runs inline on the calling thread rather than on the MLX worker:
+        dropping the Python reference is thread-safe (MLX frees buffers
+        through its global allocator, no stream needed), and routing it
+        through the single worker would block the caller — usually the
+        FastAPI event loop, via /models/unload — until any in-flight
+        generation on that worker finishes. A generation still running bound
+        the model to a local before it started, so it completes normally and
+        the next generate() reloads via _reload_and_generate_sync.
+        """
+        self._unload_model_sync()
+
+    def _unload_model_sync(self):
         if self.model is not None:
             del self.model
             self.model = None
             self._current_model_size = None
+            empty_mlx_cache()
             logger.info("MLX TTS model unloaded")
 
     async def create_voice_prompt(
@@ -132,7 +177,8 @@ class MLXTTSBackend:
         Returns:
             Tuple of (voice_prompt_dict, was_cached)
         """
-        await self.load_model_async(None)
+        async with self._op_lock:
+            await self.load_model_async(None)
 
         # Check cache if enabled
         if use_cache:
@@ -187,79 +233,112 @@ class MLXTTSBackend:
         Returns:
             Tuple of (audio_array, sample_rate)
         """
-        await self.load_model_async(None)
-
         logger.info("Generating audio for text: %s", text)
 
         def _generate_sync():
             """Run synchronous generation in thread pool."""
-            # MLX generate() returns a generator yielding GenerationResult objects
-            audio_chunks = []
-            sample_rate = 24000
-            lang = LANGUAGE_CODE_TO_NAME.get(language, "auto")
-
-            # Set seed if provided (MLX uses numpy random)
-            if seed is not None:
-                import mlx.core as mx
-
-                np.random.seed(seed)
-                mx.random.seed(seed)
-
-            # Extract voice prompt info
-            ref_audio = voice_prompt.get("ref_audio") or voice_prompt.get("ref_audio_path")
-            ref_text = voice_prompt.get("ref_text", "")
-
-            # Validate that the audio file exists
-            if ref_audio and not Path(ref_audio).exists():
-                logger.warning("Audio file not found: %s", ref_audio)
-                logger.warning("This may be due to a cached voice prompt referencing a deleted temp file.")
-                logger.warning("Regenerating without voice prompt.")
-                ref_audio = None
-
-            # Inference runs with the process's default HF_HUB_OFFLINE
-            # state. Forcing offline here (previously used to avoid lazy
-            # mlx_audio lookups hanging when the network drops mid-inference,
-            # issue #462) regressed online users because libraries make
-            # legitimate metadata calls during generation.
+            # Bind the model once so an inline unload_model() from another
+            # thread mid-generation cannot turn a later self.model read into
+            # None (the fallback path below runs seconds into a request).
+            model = self.model
             try:
-                if ref_audio:
-                    # Check if generate accepts ref_audio parameter
-                    import inspect
+                # MLX generate() returns a generator yielding GenerationResult objects
+                audio_chunks = []
+                sample_rate = 24000
+                lang = LANGUAGE_CODE_TO_NAME.get(language, "auto")
 
-                    sig = inspect.signature(self.model.generate)
-                    if "ref_audio" in sig.parameters:
-                        # Generate with voice cloning
-                        for result in self.model.generate(text, ref_audio=ref_audio, ref_text=ref_text, lang_code=lang):
-                            audio_chunks.append(np.array(result.audio))
-                            sample_rate = result.sample_rate
+                # Set seed if provided (MLX uses numpy random)
+                if seed is not None:
+                    import mlx.core as mx
+
+                    np.random.seed(seed)
+                    mx.random.seed(seed)
+
+                # Extract voice prompt info
+                ref_audio = voice_prompt.get("ref_audio") or voice_prompt.get("ref_audio_path")
+                ref_text = voice_prompt.get("ref_text", "")
+
+                # Validate that the audio file exists
+                if ref_audio and not Path(ref_audio).exists():
+                    logger.warning("Audio file not found: %s", ref_audio)
+                    logger.warning("This may be due to a cached voice prompt referencing a deleted temp file.")
+                    logger.warning("Regenerating without voice prompt.")
+                    ref_audio = None
+
+                # Inference runs with the process's default HF_HUB_OFFLINE
+                # state. Forcing offline here (previously used to avoid lazy
+                # mlx_audio lookups hanging when the network drops mid-inference,
+                # issue #462) regressed online users because libraries make
+                # legitimate metadata calls during generation.
+                try:
+                    if ref_audio:
+                        # Check if generate accepts ref_audio parameter
+                        import inspect
+
+                        sig = inspect.signature(model.generate)
+                        if "ref_audio" in sig.parameters:
+                            # Generate with voice cloning
+                            for result in model.generate(text, ref_audio=ref_audio, ref_text=ref_text, lang_code=lang):
+                                audio_chunks.append(np.array(result.audio))
+                                sample_rate = result.sample_rate
+                        else:
+                            # Fallback: generate without voice cloning
+                            for result in model.generate(text, lang_code=lang):
+                                audio_chunks.append(np.array(result.audio))
+                                sample_rate = result.sample_rate
                     else:
-                        # Fallback: generate without voice cloning
-                        for result in self.model.generate(text, lang_code=lang):
+                        # No voice prompt, generate normally
+                        for result in model.generate(text, lang_code=lang):
                             audio_chunks.append(np.array(result.audio))
                             sample_rate = result.sample_rate
-                else:
-                    # No voice prompt, generate normally
-                    for result in self.model.generate(text, lang_code=lang):
+                except Exception as e:
+                    # If voice cloning fails, try without it
+                    logger.warning("Voice cloning failed, generating without voice prompt: %s", e)
+                    for result in model.generate(text, lang_code=lang):
                         audio_chunks.append(np.array(result.audio))
                         sample_rate = result.sample_rate
-            except Exception as e:
-                # If voice cloning fails, try without it
-                logger.warning("Voice cloning failed, generating without voice prompt: %s", e)
-                for result in self.model.generate(text, lang_code=lang):
-                    audio_chunks.append(np.array(result.audio))
-                    sample_rate = result.sample_rate
 
-            # Concatenate all chunks
-            if audio_chunks:
-                audio = np.concatenate([np.asarray(chunk, dtype=np.float32) for chunk in audio_chunks])
-            else:
-                # Fallback: empty audio
-                audio = np.array([], dtype=np.float32)
+                # Concatenate all chunks
+                if audio_chunks:
+                    audio = np.concatenate([np.asarray(chunk, dtype=np.float32) for chunk in audio_chunks])
+                else:
+                    # Fallback: empty audio
+                    audio = np.array([], dtype=np.float32)
 
-            return audio, sample_rate
+                return audio, sample_rate
+            finally:
+                # Drop the local binding here, inside the frame a propagating
+                # traceback would keep alive, so the caller's drain can
+                # actually return the model's buffers to MLX.
+                del model
 
-        # Run blocking inference in thread pool
-        audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        def _reload_and_generate_sync():
+            """Ensure the configured model is loaded, then generate — as ONE
+            MLX-worker submission. Two separate submissions (load, then
+            generate) leave a gap after the load future resolves and before
+            the generate future is submitted; an unload_model() call from
+            another thread could land in that gap and tear down the model
+            this call is about to use. Folding both into one callable closes
+            the gap: the executor's own FIFO ordering is the only guarantee
+            this needs, and the reload check here is self-healing even if an
+            unload happened to run just before this callable started.
+            """
+            if self.model is None or self._current_model_size != self.model_size:
+                self._reload_sync(self.model_size)
+            try:
+                return _generate_sync()
+            finally:
+                # An unload_model() that landed while we were generating only
+                # dropped the backend's reference; the model's buffers were
+                # kept alive by _generate_sync's local, which that function
+                # drops in its own finally (so a propagating traceback cannot
+                # pin it), and have just been returned to MLX's pool. Drain it
+                # now, or they stay resident until the next load/unload cycle.
+                if self.model is None:
+                    empty_mlx_cache()
+
+        async with self._op_lock:
+            audio, sample_rate = await _run_on_mlx_thread(_reload_and_generate_sync)
 
         return audio, sample_rate
 
@@ -270,6 +349,8 @@ class MLXSTTBackend:
     def __init__(self, model_size: str = "base"):
         self.model = None
         self.model_size = model_size
+        # See MLXTTSBackend._op_lock — same reason.
+        self._op_lock = asyncio.Lock()
 
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
@@ -293,7 +374,7 @@ class MLXSTTBackend:
             return
 
         # Run blocking load in thread pool
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        await _run_on_mlx_thread(self._load_model_sync, model_size)
 
     # Alias for compatibility
     load_model = load_model_async
@@ -315,10 +396,14 @@ class MLXSTTBackend:
         logger.info("MLX Whisper model %s loaded successfully", model_size)
 
     def unload_model(self):
-        """Unload the model to free memory."""
+        """Unload the model to free memory (inline; see MLXTTSBackend.unload_model)."""
+        self._unload_model_sync()
+
+    def _unload_model_sync(self):
         if self.model is not None:
             del self.model
             self.model = None
+            empty_mlx_cache()
             logger.info("MLX Whisper model unloaded")
 
     async def transcribe(
@@ -338,30 +423,53 @@ class MLXSTTBackend:
         Returns:
             Transcribed text
         """
-        await self.load_model_async(model_size)
+        resolved_size = model_size if model_size is not None else self.model_size
 
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
             # MLX Whisper transcription using generate method
             # The generate method accepts audio path directly
-            decode_options = {}
-            if language:
-                decode_options["language"] = language
+            model = self.model
+            try:
+                decode_options = {}
+                if language:
+                    decode_options["language"] = language
 
-            # Inference runs with the process's default HF_HUB_OFFLINE
-            # state — see the comment in MLXTTSBackend.generate for the
-            # regression this revert fixes (issue #462).
-            result = self.model.generate(str(audio_path), **decode_options)
+                # Inference runs with the process's default HF_HUB_OFFLINE
+                # state — see the comment in MLXTTSBackend.generate for the
+                # regression this revert fixes (issue #462).
+                result = model.generate(str(audio_path), **decode_options)
 
-            # Extract text from result
-            if isinstance(result, str):
-                return result.strip()
-            elif isinstance(result, dict):
-                return result.get("text", "").strip()
-            elif hasattr(result, "text"):
-                return result.text.strip()
-            else:
-                return str(result).strip()
+                # Extract text from result
+                if isinstance(result, str):
+                    return result.strip()
+                elif isinstance(result, dict):
+                    return result.get("text", "").strip()
+                elif hasattr(result, "text"):
+                    return result.text.strip()
+                else:
+                    return str(result).strip()
+            finally:
+                # Drop the local binding here, inside the frame a propagating
+                # traceback would keep alive, so the caller's drain can
+                # actually return the model's buffers to MLX.
+                del model
 
-        # Run blocking transcription in thread pool
-        return await asyncio.to_thread(_transcribe_sync)
+        def _reload_and_transcribe_sync():
+            """Ensure the requested model is loaded, then transcribe — as ONE
+            MLX-worker submission. See MLXTTSBackend._reload_and_generate_sync
+            for why this needs to be a single callable rather than a separate
+            load-then-transcribe pair.
+            """
+            if self.model is None or self.model_size != resolved_size:
+                self._load_model_sync(resolved_size)
+            try:
+                return _transcribe_sync()
+            finally:
+                # See MLXTTSBackend._reload_and_generate_sync: drain the pool
+                # if an unload landed mid-transcription.
+                if self.model is None:
+                    empty_mlx_cache()
+
+        async with self._op_lock:
+            return await _run_on_mlx_thread(_reload_and_transcribe_sync)

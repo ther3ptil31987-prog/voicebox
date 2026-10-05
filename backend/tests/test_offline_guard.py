@@ -12,9 +12,11 @@ parallelism (e.g. ``pytest-xdist`` with ``--dist=loadfile``/``loadscope``);
 run this file serially.
 """
 
+import multiprocessing
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,27 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.hf_offline_patch import force_offline_if_cached  # noqa: E402
+
+
+def _nest_opposite_modes_in_subprocess(queue):
+    """Module-level so it's picklable for multiprocessing's spawn start method.
+
+    Runs in a fresh child process rather than a thread of the test process,
+    so a real deadlock here (a regression of the guard this test exists for)
+    can't leave the shared _offline_cv state corrupted for every other test
+    in this run: the child either exits cleanly (guard raised) or gets
+    terminated by the parent after the timeout, and either way the test
+    process's own state was never touched.
+    """
+    try:
+        with force_offline_if_cached(False, "outer-uncached"), force_offline_if_cached(
+            True, "inner-cached"
+        ):
+            pass
+    except Exception as exc:
+        queue.put(("exc", type(exc).__name__, str(exc)))
+    else:
+        queue.put(("ok", None, None))
 
 
 def _hf_const():
@@ -112,6 +135,79 @@ def test_concurrent_threads_share_offline_window():
     assert not errors, errors
     assert observations == [True], "slow thread lost offline protection"
     assert original == _hf_const().HF_HUB_OFFLINE
+
+
+def test_uncached_load_never_observes_offline_flag_from_concurrent_cached_load():
+    """An uncached (network-needing) load must never inherit the forced
+    offline mode of a concurrent, unrelated cached load — even when both
+    start at nearly the same time.
+    """
+    original = _hf_const().HF_HUB_OFFLINE
+    observations: list[bool] = []
+    errors: list[Exception] = []
+    cached_entered = threading.Event()
+
+    def cached_load():
+        try:
+            with force_offline_if_cached(True, "cached"):
+                cached_entered.set()
+                time.sleep(0.2)
+        except Exception as exc:
+            errors.append(exc)
+
+    def uncached_load():
+        try:
+            assert cached_entered.wait(timeout=5), "cached thread never entered"
+            with force_offline_if_cached(False, "uncached"):
+                observations.append(_hf_const().HF_HUB_OFFLINE)
+        except Exception as exc:
+            errors.append(exc)
+
+    t_cached = threading.Thread(target=cached_load)
+    t_uncached = threading.Thread(target=uncached_load)
+    t_cached.start()
+    t_uncached.start()
+    t_cached.join(timeout=5)
+    t_uncached.join(timeout=5)
+
+    assert not t_cached.is_alive(), "cached thread did not finish"
+    assert not t_uncached.is_alive(), "uncached thread did not finish"
+    assert not errors, errors
+    assert observations == [False], "uncached load observed offline mode forced by a concurrent cached load"
+    assert original == _hf_const().HF_HUB_OFFLINE
+
+
+def test_nesting_opposite_mode_on_same_thread_raises_instead_of_deadlocking():
+    """Nesting is_cached=True inside is_cached=False (or vice versa) on the
+    same thread must raise immediately, not hang: the inner call's wait
+    condition can only be cleared by the outer call's own exit, which can
+    never run because it's blocked inside the inner call waiting for it.
+
+    Runs in a spawned child process with a bounded join, terminated if it's
+    still alive after the timeout, so a regression fails this test instead of
+    hanging the suite or leaving _offline_cv's shared state corrupted for
+    every other test in this run.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_nest_opposite_modes_in_subprocess, args=(queue,))
+    proc.start()
+    proc.join(timeout=5)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+        pytest.fail(
+            "nesting the opposite mode on the same thread hung instead of raising, "
+            "this is the deadlock the per-thread mode-stack guard exists to prevent"
+        )
+
+    kind, exc_type, exc_msg = queue.get(timeout=2)
+    assert kind == "exc", (kind, exc_type, exc_msg)
+    assert exc_type == "RuntimeError", (kind, exc_type, exc_msg)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ voice prompt combination, and model loading progress tracking.
 """
 
 import logging
+import os
 import platform
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,11 +15,30 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 from ..utils.audio import normalize_audio, load_audio
+from ..utils.hf_offline_patch import force_offline_if_cached
 from ..utils.progress import get_progress_manager
 from ..utils.hf_progress import HFProgressTracker, create_hf_progress_callback
 from ..utils.tasks import get_task_manager
 
 logger = logging.getLogger(__name__)
+
+
+def has_in_progress_download(blobs_dir: Path) -> bool:
+    """
+    Whether a HuggingFace repo's ``blobs`` dir holds a genuinely in-progress download.
+
+    An ``.incomplete`` blob means a download is still in progress -- unless a
+    completed blob with the same hash already sits next to it, which happens
+    when a retried/concurrent download leaves a stale ``.incomplete`` behind
+    after the real transfer already finished. Only orphaned ``.incomplete``
+    files (no matching completed blob) count as "in progress".
+    """
+    if not blobs_dir.exists():
+        return False
+    return any(
+        not incomplete.with_name(incomplete.name.removesuffix(".incomplete")).exists()
+        for incomplete in blobs_dir.glob("*.incomplete")
+    )
 
 
 def is_model_cached(
@@ -47,10 +67,8 @@ def is_model_cached(
         if not repo_cache.exists():
             return False
 
-        # Incomplete blobs mean a download is still in progress
-        blobs_dir = repo_cache / "blobs"
-        if blobs_dir.exists() and any(blobs_dir.glob("*.incomplete")):
-            logger.debug(f"Found .incomplete files for {hf_repo}")
+        if has_in_progress_download(repo_cache / "blobs"):
+            logger.debug(f"Found in-progress .incomplete file for {hf_repo}")
             return False
 
         snapshots_dir = repo_cache / "snapshots"
@@ -77,6 +95,13 @@ def is_model_cached(
         return False
 
 
+# Documented escape hatch (docs/content/docs/overview/gpu-acceleration.mdx):
+# users whose GPU has no compiled kernels in the bundled PyTorch set this to run
+# on CPU instead of crashing at generation time.
+FORCE_CPU_ENV_VAR = "VOICEBOX_FORCE_CPU"
+FORCE_CPU_ENABLED_VALUE = "1"
+
+
 def get_torch_device(
     *,
     allow_xpu: bool = False,
@@ -92,7 +117,17 @@ def get_torch_device(
         allow_directml: Check for DirectML (Windows) support.
         allow_mps: Allow MPS (Apple Silicon). If False, MPS falls back to CPU.
         force_cpu_on_mac: Force CPU on macOS regardless of GPU availability.
+
+    The VOICEBOX_FORCE_CPU override wins over every other candidate, and is
+    resolved before torch is imported so it still works when the installed
+    build is the reason CPU is wanted.
     """
+    # Stripped: on Windows, where this override matters most, it is usually set
+    # through the GUI environment editor.
+    if os.environ.get(FORCE_CPU_ENV_VAR, "").strip() == FORCE_CPU_ENABLED_VALUE:
+        logger.info("%s=%s set, forcing CPU device", FORCE_CPU_ENV_VAR, FORCE_CPU_ENABLED_VALUE)
+        return "cpu"
+
     if force_cpu_on_mac and platform.system() == "Darwin":
         return "cpu"
 
@@ -171,17 +206,42 @@ def check_cuda_compatibility() -> tuple[bool, str | None]:
 
 def empty_device_cache(device: str) -> None:
     """
-    Free cached memory on the given device (CUDA or XPU).
+    Free cached memory and unreferenced tensors on the given device (CUDA, XPU, MPS, CPU).
 
-    Backends should call this after unloading models so VRAM is returned
-    to the OS.
+    Backends call this after model unloading and post-generation cleanup to return
+    memory to the OS and prevent process heap accumulation.
     """
+    import gc
     import torch
+
+    gc.collect()
 
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
     elif device == "xpu" and hasattr(torch, "xpu"):
         torch.xpu.empty_cache()
+    elif device == "mps" and torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+
+
+def empty_mlx_cache() -> None:
+    """
+    Free cached memory in the MLX allocator.
+
+    MLX keeps freed array buffers in an internal pool for reuse instead of
+    returning them to the OS. Backends must call this after unloading an
+    MLX model, or the process's memory footprint never shrinks even though
+    the model object itself was dropped.
+
+    Safe from any thread: ``mx.clear_cache`` only drains the global
+    allocator pool and never touches the per-thread stream registry, so
+    unlike load/generate it does not have to run on the MLX worker thread
+    (verified from the FastAPI event loop with a generation in flight on
+    the worker).
+    """
+    import mlx.core as mx
+
+    mx.clear_cache()
 
 
 def manual_seed(seed: int, device: str) -> None:
@@ -280,7 +340,8 @@ def model_load_progress(
         )
 
     try:
-        yield tracker_context
+        with force_offline_if_cached(is_cached, model_name):
+            yield tracker_context
     except Exception as e:
         # Report error to both managers
         progress_manager.mark_error(model_name, str(e))

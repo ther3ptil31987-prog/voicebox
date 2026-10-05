@@ -8,6 +8,7 @@ import io
 import soundfile as sf
 
 from ..backends import get_tts_backend, TTSBackend
+from ..utils.cache import clear_voice_prompt_memory_cache
 
 
 def get_tts_model() -> TTSBackend:
@@ -23,6 +24,7 @@ def get_tts_model() -> TTSBackend:
 def unload_tts_model():
     """Unload TTS model to free memory."""
     backend = get_tts_backend()
+    clear_voice_prompt_memory_cache()
     backend.unload_model()
 
 

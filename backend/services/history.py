@@ -3,7 +3,8 @@ Generation history management module.
 """
 
 from typing import List, Optional, Tuple
-from datetime import datetime
+from datetime import UTC, datetime
+import logging
 import uuid
 import shutil
 from pathlib import Path
@@ -11,25 +12,49 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from ..models import GenerationRequest, GenerationResponse, HistoryQuery, HistoryResponse, HistoryListResponse, GenerationVersionResponse, EffectConfig
-from ..database import Generation as DBGeneration, GenerationVersion as DBGenerationVersion, VoiceProfile as DBVoiceProfile
+from ..database import Generation as DBGeneration, GenerationVersion as DBGenerationVersion, StoryItem as DBStoryItem, VoiceProfile as DBVoiceProfile
 from .. import config
 
+logger = logging.getLogger(__name__)
 
-def _get_versions_for_generation(generation_id: str, db: Session) -> tuple:
-    """Get versions list and active version ID for a generation."""
+
+def _delete_generation_children(generation_id: str, db: Session, commit: bool = True) -> None:
+    """Remove the rows that reference a generation, plus any version audio files.
+
+    Story items and versions both point at the generation by a non-null FK.
+    The story detail query inner-joins generations, so a leftover story item
+    vanishes from the timeline while staying in the table forever.
+    """
+    from . import versions as versions_mod
+
+    db.query(DBStoryItem).filter_by(generation_id=generation_id).delete()
+    versions_mod.delete_versions_for_generation(generation_id, db, commit=commit)
+
+
+def _get_versions_for_generations(generation_ids: list[str], db: Session) -> dict:
+    """Fetch versions for many generations in a single query.
+
+    Returns a mapping of ``generation_id -> (versions, active_version_id)``
+    using the same shape as ``_get_versions_for_generation()``, so callers
+    can batch a whole page of generations without an N+1 query.
+    """
     import json
+
+    ids = list(dict.fromkeys(generation_ids))
+    if not ids:
+        return {}
+
     versions_rows = (
         db.query(DBGenerationVersion)
-        .filter_by(generation_id=generation_id)
+        .filter(DBGenerationVersion.generation_id.in_(ids))
         .order_by(DBGenerationVersion.created_at)
         .all()
     )
-    if not versions_rows:
-        return None, None
 
-    versions = []
-    active_version_id = None
+    versions_by_generation: dict[str, list] = {}
+    active_by_generation: dict[str, Optional[str]] = {}
     for v in versions_rows:
+        versions = versions_by_generation.setdefault(v.generation_id, [])
         effects_chain = None
         if v.effects_chain:
             try:
@@ -47,9 +72,20 @@ def _get_versions_for_generation(generation_id: str, db: Session) -> tuple:
             created_at=v.created_at,
         ))
         if v.is_default:
-            active_version_id = v.id
+            active_by_generation[v.generation_id] = v.id
 
-    return versions, active_version_id
+    return {
+        generation_id: (
+            versions_by_generation.get(generation_id),
+            active_by_generation.get(generation_id),
+        )
+        for generation_id in ids
+    }
+
+
+def _get_versions_for_generation(generation_id: str, db: Session) -> tuple:
+    """Get versions list and active version ID for a single generation."""
+    return _get_versions_for_generations([generation_id], db)[generation_id]
 
 
 async def create_generation(
@@ -104,7 +140,7 @@ async def create_generation(
         model_size=model_size,
         status=status,
         source=source,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(UTC),
     )
 
     db.add(db_generation)
@@ -205,10 +241,16 @@ async def list_generations(
     # Execute query
     results = q.all()
     
+    # Fetch versions for every generation on this page with a single
+    # query instead of one SELECT per generation (N+1).
+    versions_by_generation = _get_versions_for_generations(
+        [generation.id for generation, _ in results], db
+    )
+
     # Convert to HistoryResponse with profile_name
     items = []
     for generation, profile_name in results:
-        versions, active_version_id = _get_versions_for_generation(generation.id, db)
+        versions, active_version_id = versions_by_generation[generation.id]
         items.append(HistoryResponse(
             id=generation.id,
             profile_id=generation.profile_id,
@@ -253,15 +295,21 @@ async def delete_generation(
     if not generation:
         return False
 
-    # Delete all version files and records
-    from . import versions as versions_mod
-    versions_mod.delete_versions_for_generation(generation_id, db)
+    # Delete all version files and records; the rows are committed together
+    # with the generation row below (one commit for the whole delete).
+    _delete_generation_children(generation_id, db, commit=False)
 
     # Delete main audio file (if not already removed by version cleanup)
     if generation.audio_path:
         audio_path = config.resolve_storage_path(generation.audio_path)
         if audio_path is not None and audio_path.exists():
-            audio_path.unlink()
+            try:
+                audio_path.unlink()
+            except OSError:
+                # Version files are already gone by now, so rolling back would
+                # leave rows pointing at missing audio. Mirror the sweep below:
+                # keep going and leave the locked file as an orphan instead.
+                logger.warning("Could not delete generation audio %s", audio_path)
 
     # Delete from database
     db.delete(generation)
@@ -281,13 +329,11 @@ async def delete_failed_generations(db: Session) -> int:
     Returns:
         Number of generations deleted.
     """
-    from . import versions as versions_mod
-
     failed = db.query(DBGeneration).filter(DBGeneration.status == "failed").all()
     count = 0
     for generation in failed:
-        # Clean up version files/rows first.
-        versions_mod.delete_versions_for_generation(generation.id, db)
+        # Clean up version files/rows first; one commit at the end.
+        _delete_generation_children(generation.id, db, commit=False)
 
         # Remove the main audio file if it somehow made it to disk.
         if generation.audio_path:
@@ -298,7 +344,7 @@ async def delete_failed_generations(db: Session) -> int:
                 except OSError:
                     # Best-effort cleanup — don't abort the whole sweep
                     # if a single file can't be removed.
-                    pass
+                    logger.warning("Could not delete generation audio %s", audio_path)
 
         db.delete(generation)
         count += 1
@@ -310,14 +356,18 @@ async def delete_failed_generations(db: Session) -> int:
 async def delete_generations_by_profile(
     profile_id: str,
     db: Session,
+    commit: bool = True,
 ) -> int:
     """
     Delete all generations for a profile.
-    
+
     Args:
         profile_id: Profile ID
         db: Database session
-        
+        commit: Commit at the end. Pass False when the caller owns the
+            transaction (e.g. deleting the profile itself) so the whole
+            cascade lands in one commit.
+
     Returns:
         Number of generations deleted
     """
@@ -326,20 +376,25 @@ async def delete_generations_by_profile(
     count = 0
     for generation in generations:
         # Delete associated version files and rows first
-        from . import versions as versions_mod
-        versions_mod.delete_versions_for_generation(generation.id, db)
+        _delete_generation_children(generation.id, db, commit=commit)
 
         # Delete audio file
         audio_path = config.resolve_storage_path(generation.audio_path)
         if audio_path is not None and audio_path.exists():
-            audio_path.unlink()
-        
+            try:
+                audio_path.unlink()
+            except OSError:
+                # A file locked by playback shouldn't abort the whole sweep
+                # and leave the profile half-deleted.
+                logger.warning("Could not delete generation audio %s", audio_path)
+
         # Delete from database
         db.delete(generation)
         count += 1
-    
-    db.commit()
-    
+
+    if commit:
+        db.commit()
+
     return count
 
 

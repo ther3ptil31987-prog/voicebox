@@ -140,13 +140,13 @@ def _get_or_create_row(db: Session) -> DBCloudSettings:
 
 
 def _store_key(db: Session, *, api_key: str, device_name: str | None, account_user_id: str | None):
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     row = _get_or_create_row(db)
     row.api_key = api_key
     row.device_name = device_name
     row.account_user_id = account_user_id
-    row.connected_at = datetime.utcnow()
+    row.connected_at = datetime.now(UTC)
     db.commit()
 
 

@@ -16,6 +16,7 @@ from .base import (
     is_model_cached,
     get_torch_device,
     empty_device_cache,
+    empty_mlx_cache,
     manual_seed,
     model_load_progress,
 )
@@ -190,6 +191,9 @@ class MLXQwenLLMBackend:
         self.tokenizer = None
         self.model_size = model_size
         self._current_model_size: Optional[str] = None
+        # Same role as MLXTTSBackend._op_lock: keeps two coroutines from
+        # racing their reload decisions around one load-then-generate.
+        self._op_lock = asyncio.Lock()
 
     def is_loaded(self) -> bool:
         return self.model is not None
@@ -212,10 +216,19 @@ class MLXQwenLLMBackend:
         if self.model is not None and self._current_model_size == model_size:
             return
 
+        # Routed through the same dedicated MLX thread as TTS/STT — MLX's
+        # Metal stream is thread-local, so load and generate must run on
+        # one thread (see mlx_backend._run_on_mlx_thread / issue #699).
+        from .mlx_backend import _run_on_mlx_thread
+
+        async with self._op_lock:
+            await _run_on_mlx_thread(self._reload_sync, model_size)
+
+    def _reload_sync(self, model_size: str) -> None:
+        """Unload a mismatched model and load the requested one, in one MLX-thread op."""
         if self.model is not None and self._current_model_size != model_size:
             self.unload_model()
-
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        self._load_model_sync(model_size)
 
     def _load_model_sync(self, model_size: str) -> None:
         from mlx_lm import load as mlx_load
@@ -246,6 +259,7 @@ class MLXQwenLLMBackend:
         self.model = None
         self.tokenizer = None
         self._current_model_size = None
+        empty_mlx_cache()
         logger.info("Qwen3 (MLX) unloaded")
 
     async def generate(
@@ -257,10 +271,27 @@ class MLXQwenLLMBackend:
         model_size: Optional[str] = None,
         examples: Optional[list[tuple[str, str]]] = None,
     ) -> str:
-        await self.load_model(model_size)
-        return await asyncio.to_thread(
-            self._generate_sync, prompt, system, max_tokens, temperature, examples
-        )
+        from .mlx_backend import _run_on_mlx_thread
+
+        resolved_size = model_size if model_size is not None else self.model_size
+
+        def _reload_and_generate_sync() -> str:
+            # One worker submission for load + generate, as in
+            # MLXTTSBackend._reload_and_generate_sync: no gap between the two
+            # where another request's load_model (different size) or an
+            # unload can swap or null out self.model / self.tokenizer.
+            if self.model is None or self._current_model_size != resolved_size:
+                self._reload_sync(resolved_size)
+            try:
+                return self._generate_sync(prompt, system, max_tokens, temperature, examples)
+            finally:
+                # Drain the MLX pool if an unload landed mid-generation (see
+                # MLXTTSBackend._reload_and_generate_sync).
+                if self.model is None:
+                    empty_mlx_cache()
+
+        async with self._op_lock:
+            return await _run_on_mlx_thread(_reload_and_generate_sync)
 
     def _generate_sync(
         self,
@@ -273,21 +304,28 @@ class MLXQwenLLMBackend:
         from mlx_lm import generate as mlx_generate
         from mlx_lm.sample_utils import make_sampler
 
-        messages = _build_messages(prompt, system, examples)
-        chat_prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
+        model, tokenizer = self.model, self.tokenizer
+        try:
+            messages = _build_messages(prompt, system, examples)
+            chat_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
 
-        sampler = make_sampler(temp=temperature, top_p=0.9) if temperature > 0 else None
-        text = mlx_generate(
-            self.model,
-            self.tokenizer,
-            prompt=chat_prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            verbose=False,
-        )
-        return text.strip()
+            sampler = make_sampler(temp=temperature, top_p=0.9) if temperature > 0 else None
+            text = mlx_generate(
+                model,
+                tokenizer,
+                prompt=chat_prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                verbose=False,
+            )
+            return text.strip()
+        finally:
+            # Drop the local binding here, inside the frame a propagating
+            # traceback would keep alive, so the caller's drain can
+            # actually return the model's buffers to MLX.
+            del model, tokenizer

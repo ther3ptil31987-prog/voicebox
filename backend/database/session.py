@@ -3,7 +3,7 @@
 import logging
 import uuid
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from .. import config
@@ -20,6 +20,7 @@ from .migrations import run_migrations
 from .seed import backfill_generation_versions, seed_builtin_presets
 
 logger = logging.getLogger(__name__)
+
 
 # Initialized by init_db()
 engine = None
@@ -38,6 +39,20 @@ def init_db() -> None:
         f"sqlite:///{_db_path}",
         connect_args={"check_same_thread": False},
     )
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _record) -> None:
+        # Each pooled connection enables WAL journal mode and sets a 5-second
+        # busy timeout.  WAL allows concurrent readers during a write (the
+        # default DELETE/ROLLBACK journal blocks all readers), which matters
+        # for voicebox because SSE status polls and history queries run
+        # concurrently with the generation worker writing to the same db.
+        # busy_timeout prevents "database is locked" errors when two
+        # connections briefly contend on the same write slot.
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
 
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

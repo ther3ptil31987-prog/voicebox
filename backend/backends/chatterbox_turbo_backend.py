@@ -29,11 +29,19 @@ logger = logging.getLogger(__name__)
 
 CHATTERBOX_TURBO_HF_REPO = "ResembleAI/chatterbox-turbo"
 
-# Files that must be present for the turbo model
+# The files ChatterboxTurboTTS.from_local() reads, as of chatterbox-tts 0.1.7:
+# the three weight files, the GPT-2 tokenizer files AutoTokenizer needs, and
+# the built-in voice. The load runs with HF offline mode forced when this
+# reports cached, so a partial snapshot must not count as cached -- if upstream
+# starts reading another file, add it here too.
 _TURBO_WEIGHT_FILES = [
     "t3_turbo_v1.safetensors",
     "s3gen_meanflow.safetensors",
     "ve.safetensors",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "conds.pt",
 ]
 
 
@@ -184,20 +192,21 @@ class ChatterboxTurboTTSBackend:
 
             logger.info("[Chatterbox Turbo] Generating (English)")
 
-            wav = self.model.generate(
-                text,
-                audio_prompt_path=ref_audio,
-                temperature=0.8,
-                top_k=1000,
-                top_p=0.95,
-                repetition_penalty=1.2,
-            )
+            with torch.inference_mode():
+                wav = self.model.generate(
+                    text,
+                    audio_prompt_path=ref_audio,
+                    temperature=0.8,
+                    top_k=1000,
+                    top_p=0.95,
+                    repetition_penalty=1.2,
+                )
 
-            # Convert tensor -> numpy
-            if isinstance(wav, torch.Tensor):
-                audio = wav.squeeze().cpu().numpy().astype(np.float32)
-            else:
-                audio = np.asarray(wav, dtype=np.float32)
+                # Convert tensor -> numpy
+                if isinstance(wav, torch.Tensor):
+                    audio = wav.squeeze().cpu().numpy().astype(np.float32)
+                else:
+                    audio = np.asarray(wav, dtype=np.float32)
 
             sample_rate = getattr(self.model, "sr", None) or getattr(self.model, "sample_rate", 24000)
 

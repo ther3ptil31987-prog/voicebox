@@ -17,6 +17,7 @@ Mode differences:
 from __future__ import annotations
 
 import asyncio
+import logging
 import traceback
 from typing import Literal, Optional
 
@@ -24,6 +25,22 @@ from .. import config
 from . import history, profiles
 from ..database import get_db
 from ..utils.tasks import get_task_manager
+
+
+def release_generation_memory(tts_model) -> None:
+    """Best-effort post-generation memory cleanup.
+
+    Collects garbage and flushes the device allocator cache so the process heap
+    does not grow across consecutive generations (#923). Never raises: a
+    cleanup failure (e.g. a poisoned CUDA context) must not replace the
+    generation's own result or error.
+    """
+    from ..backends.base import empty_device_cache
+
+    try:
+        empty_device_cache(getattr(tts_model, "device", "cpu"))
+    except Exception as e:
+        logging.getLogger(__name__).debug("post-generation cache cleanup failed: %s", e)
 
 
 async def run_generation(
@@ -59,6 +76,7 @@ async def run_generation(
 
     task_manager = get_task_manager()
     bg_db = next(get_db())
+    tts_model = None
 
     try:
         tts_model = get_tts_backend_for_engine(engine)
@@ -156,6 +174,7 @@ async def run_generation(
     finally:
         task_manager.complete_generation(generation_id)
         bg_db.close()
+        release_generation_memory(tts_model)
 
 
 def _notify_speak_end(generation_id: str, *, status: str) -> None:
@@ -285,6 +304,7 @@ async def generate_audio_sync(
     from . import tts
 
     bg_db = next(get_db())
+    tts_model = None
     try:
         tts_model = get_tts_backend_for_engine(engine)
         await load_engine_model(engine, model_size)
@@ -313,14 +333,17 @@ async def generate_audio_sync(
     if crossfade_ms is not None:
         gen_kwargs["crossfade_ms"] = crossfade_ms
 
-    audio, sample_rate = await generate_chunked(
-        tts_model, text, voice_prompt, **gen_kwargs
-    )
+    try:
+        audio, sample_rate = await generate_chunked(
+            tts_model, text, voice_prompt, **gen_kwargs
+        )
 
-    if normalize:
-        audio = normalize_audio(audio)
+        if normalize:
+            audio = normalize_audio(audio)
 
-    return tts.audio_to_wav_bytes(audio, sample_rate)
+        return tts.audio_to_wav_bytes(audio, sample_rate)
+    finally:
+        release_generation_memory(tts_model)
 
 
 def _save_regenerate(
